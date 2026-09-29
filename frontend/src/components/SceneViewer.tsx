@@ -3,7 +3,7 @@ import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { SceneInfo, PlacementItem } from '../services/api';
 import { projectWorldToScreen } from '../utils/transformations';
-import { Camera, Eye, EyeOff, RotateCcw, Camera as CameraIcon, Layers, Maximize2 } from 'lucide-react';
+import { Eye, EyeOff, RotateCcw, Camera as CameraIcon, Layers, Sliders } from 'lucide-react';
 
 interface SceneViewerProps {
   scene: SceneInfo | null;
@@ -29,7 +29,7 @@ export const SceneViewer: React.FC<SceneViewerProps> = ({
   const sceneRef = useRef<THREE.Scene | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
   const controlsRef = useRef<OrbitControls | null>(null);
-  const splatMeshRef = useRef<THREE.Points | THREE.InstancedMesh | null>(null);
+  const splatMeshRef = useRef<THREE.Points | null>(null);
   const objectMeshesRef = useRef<Map<string, THREE.Mesh>>(new Map());
   const gridHelperRef = useRef<THREE.GridHelper | null>(null);
 
@@ -38,6 +38,7 @@ export const SceneViewer: React.FC<SceneViewerProps> = ({
   const [fps, setFps] = useState<number>(60);
   const [renderMode, setRenderMode] = useState<'gaussian' | 'pointcloud' | 'wireframe'>('gaussian');
   const [arMode, setArMode] = useState<boolean>(false);
+  const [splatScale, setSplatScale] = useState<number>(0.45); // Crisp default size
 
   // Initialize Three.js Scene, Camera, Renderer, Controls
   useEffect(() => {
@@ -50,7 +51,7 @@ export const SceneViewer: React.FC<SceneViewerProps> = ({
     sceneThree.background = new THREE.Color('#07090e');
     sceneRef.current = sceneThree;
 
-    const camera = new THREE.PerspectiveCamera(50, width / height, 0.1, 100);
+    const camera = new THREE.PerspectiveCamera(50, width / height, 0.05, 100);
     camera.position.set(0, 1.2, 3.8);
     cameraRef.current = camera;
 
@@ -139,6 +140,16 @@ export const SceneViewer: React.FC<SceneViewerProps> = ({
     };
   }, []);
 
+  // Update splat scale uniform
+  useEffect(() => {
+    if (splatMeshRef.current && (splatMeshRef.current.material as THREE.ShaderMaterial).uniforms) {
+      const mat = splatMeshRef.current.material as THREE.ShaderMaterial;
+      if (mat.uniforms.uSplatScale) {
+        mat.uniforms.uSplatScale.value = splatScale;
+      }
+    }
+  }, [splatScale]);
+
   // Load Gaussian Splat Scene Binary (.splat)
   useEffect(() => {
     if (!scene || !sceneRef.current) return;
@@ -179,11 +190,13 @@ export const SceneViewer: React.FC<SceneViewerProps> = ({
           positions[i * 3 + 2] = pz;
 
           // Scale sx, sy, sz
-          const sx = dataView.getFloat32(offset + 12, true);
-          const sy = dataView.getFloat32(offset + 16, true);
-          const sz = dataView.getFloat32(offset + 20, true);
-          const avgScale = (Math.abs(sx) + Math.abs(sy) + Math.abs(sz)) / 3.0;
-          sizes[i] = Math.max(avgScale * 25.0, 4.0);
+          const sx = Math.abs(dataView.getFloat32(offset + 12, true));
+          const sy = Math.abs(dataView.getFloat32(offset + 16, true));
+          const sz = Math.abs(dataView.getFloat32(offset + 20, true));
+          const avgScale = (sx + sy + sz) / 3.0;
+          
+          // Crisp, tight splat radius
+          sizes[i] = Math.max(Math.min(avgScale * 18.0, 1.2), 0.15);
 
           // Color r, g, b, a (uint8)
           const r = dataView.getUint8(offset + 24) / 255.0;
@@ -199,17 +212,19 @@ export const SceneViewer: React.FC<SceneViewerProps> = ({
         geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3));
         geometry.setAttribute('size', new THREE.BufferAttribute(sizes, 1));
 
-        // Custom Gaussian Splatting Ellipsoid Shader Material with Soft Alpha Splatting
+        // Refined High-Definition Gaussian Splatting Shader
         const splatMaterial = new THREE.ShaderMaterial({
           uniforms: {
             uTime: { value: 0 },
-            uIsPointCloud: { value: renderMode === 'pointcloud' ? 1.0 : 0.0 }
+            uIsPointCloud: { value: renderMode === 'pointcloud' ? 1.0 : 0.0 },
+            uSplatScale: { value: splatScale }
           },
           vertexShader: `
             attribute float size;
             varying vec3 vColor;
             varying float vDepth;
             uniform float uIsPointCloud;
+            uniform float uSplatScale;
 
             void main() {
               vColor = color;
@@ -217,9 +232,9 @@ export const SceneViewer: React.FC<SceneViewerProps> = ({
               vDepth = -mvPosition.z;
               gl_Position = projectionMatrix * mvPosition;
               
-              // True screen-space Gaussian radius scaling with distance
-              gl_PointSize = size * (300.0 / -mvPosition.z);
-              gl_PointSize = clamp(gl_PointSize, 2.0, 64.0);
+              // Refined screen-space size scaling with distance
+              float ptSize = size * uSplatScale * (380.0 / max(-mvPosition.z, 0.1));
+              gl_PointSize = clamp(ptSize, 1.0, 28.0);
             }
           `,
           fragmentShader: `
@@ -228,7 +243,6 @@ export const SceneViewer: React.FC<SceneViewerProps> = ({
             uniform float uIsPointCloud;
 
             void main() {
-              // Soft 2D Gaussian falloff: exp(-0.5 * r^2 / sigma^2)
               vec2 coord = gl_PointCoord - vec2(0.5);
               float distSq = dot(coord, coord);
               
@@ -237,14 +251,14 @@ export const SceneViewer: React.FC<SceneViewerProps> = ({
                 gl_FragColor = vec4(vColor, 1.0);
               } else {
                 if (distSq > 0.25) discard;
-                // Gaussian intensity alpha curve
-                float alpha = exp(-distSq * 8.0);
+                // Soft Gaussian edge falloff
+                float alpha = exp(-distSq * 10.0);
                 gl_FragColor = vec4(vColor, alpha);
               }
             }
           `,
           transparent: true,
-          depthWrite: false, // Gaussian splats sort and composite with alpha
+          depthWrite: false,
           depthTest: true,
           blending: THREE.NormalBlending,
           vertexColors: true
@@ -257,7 +271,7 @@ export const SceneViewer: React.FC<SceneViewerProps> = ({
         setLoadingProgress(100);
         setIsLoading(false);
 
-        // Reset camera to default scene camera
+        // Reset camera to fit loaded scene
         if (cameraRef.current && controlsRef.current && scene.camera) {
           cameraRef.current.position.set(...scene.camera.position);
           controlsRef.current.target.set(...scene.camera.target);
@@ -270,14 +284,13 @@ export const SceneViewer: React.FC<SceneViewerProps> = ({
       });
   }, [scene, renderMode]);
 
-  // Sync Virtual Objects (Cube, Sphere, Cylinder, Cone) with Three.js Scene
+  // Sync Virtual Objects (Cube, Sphere, Cylinder, Cone)
   useEffect(() => {
     if (!sceneRef.current || !cameraRef.current) return;
 
     const currentMeshes = objectMeshesRef.current;
     const activeIds = new Set(placements.map(p => p.object_id));
 
-    // Remove obsolete meshes
     for (const [id, mesh] of currentMeshes.entries()) {
       if (!activeIds.has(id)) {
         sceneRef.current.remove(mesh);
@@ -287,7 +300,6 @@ export const SceneViewer: React.FC<SceneViewerProps> = ({
       }
     }
 
-    // Add or Update Meshes
     placements.forEach(p => {
       let mesh = currentMeshes.get(p.object_id);
       const isSelected = p.object_id === selectedObjectId;
@@ -328,7 +340,6 @@ export const SceneViewer: React.FC<SceneViewerProps> = ({
         currentMeshes.set(p.object_id, mesh);
       }
 
-      // Update Transform
       mesh.position.set(...p.position);
       mesh.rotation.set(
         THREE.MathUtils.degToRad(p.rotation[0]),
@@ -337,19 +348,14 @@ export const SceneViewer: React.FC<SceneViewerProps> = ({
       );
       mesh.scale.set(...p.scale);
 
-      // Update Material & Depth-Aware Occlusion
       const mat = mesh.material as THREE.MeshStandardMaterial;
       mat.color.set(p.color);
       mat.wireframe = renderMode === 'wireframe';
 
-      // Occlusion Depth Test Logic:
-      // When occlusion is enabled, the virtual object obeys depth testing with scene geometry.
-      // If disabled, object renders in front of scene.
       const shouldOcclude = globalOcclusionEnabled && p.occlusion_enabled;
       mat.depthTest = true;
       mat.depthWrite = true;
 
-      // Visual highlight for selected object
       if (isSelected) {
         mat.emissive.set('#38bdf8');
         mat.emissiveIntensity = 0.35;
@@ -361,7 +367,6 @@ export const SceneViewer: React.FC<SceneViewerProps> = ({
       mesh.visible = p.visible;
     });
 
-    // Capture depth projection statistics for bottom panel
     if (onDepthDataCaptured && cameraRef.current && containerRef.current) {
       const w = containerRef.current.clientWidth;
       const h = containerRef.current.clientHeight;
@@ -375,12 +380,10 @@ export const SceneViewer: React.FC<SceneViewerProps> = ({
         };
       });
 
-      // Pass depth frame trigger
       onDepthDataCaptured('', projections);
     }
   }, [placements, selectedObjectId, globalOcclusionEnabled, renderMode]);
 
-  // Click on 3D Object to select it
   const handlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!containerRef.current || !cameraRef.current || !sceneRef.current) return;
 
@@ -400,7 +403,6 @@ export const SceneViewer: React.FC<SceneViewerProps> = ({
     }
   };
 
-  // Reset Camera
   const handleResetCamera = () => {
     if (!cameraRef.current || !controlsRef.current) return;
     if (scene && scene.camera) {
@@ -413,7 +415,6 @@ export const SceneViewer: React.FC<SceneViewerProps> = ({
     controlsRef.current.update();
   };
 
-  // Capture Screenshot
   const handleTakeScreenshot = () => {
     if (!rendererRef.current) return;
     const dataUrl = rendererRef.current.domElement.toDataURL('image/png');
@@ -479,12 +480,31 @@ export const SceneViewer: React.FC<SceneViewerProps> = ({
           </span>
           {arMode && (
             <span className="badge badge-amber">
-              Simulated AR Camera Feed
+              Simulated AR View
             </span>
           )}
         </div>
 
-        <div style={{ display: 'flex', gap: 6 }}>
+        <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+          {/* Splat Point Crispness / Scale Slider */}
+          <div className="glass-panel" style={{ padding: '2px 8px', display: 'flex', alignItems: 'center', gap: 6 }}>
+            <Sliders size={12} color="var(--accent-cyan)" />
+            <span style={{ fontSize: '0.68rem', color: 'var(--text-muted)' }}>Splat Size</span>
+            <input
+              type="range"
+              min="0.1"
+              max="1.5"
+              step="0.05"
+              value={splatScale}
+              onChange={e => setSplatScale(parseFloat(e.target.value))}
+              style={{ width: '65px', height: '3px' }}
+              title={`Splat Scale: ${splatScale.toFixed(2)}x`}
+            />
+            <span style={{ fontSize: '0.68rem', fontFamily: 'var(--font-mono)', width: '28px' }}>
+              {splatScale.toFixed(1)}x
+            </span>
+          </div>
+
           <button
             className="btn-secondary"
             title="Switch Render Mode"
@@ -500,7 +520,7 @@ export const SceneViewer: React.FC<SceneViewerProps> = ({
             onClick={handleResetCamera}
           >
             <RotateCcw size={14} />
-            Reset Camera
+            Reset
           </button>
 
           <button
@@ -510,7 +530,7 @@ export const SceneViewer: React.FC<SceneViewerProps> = ({
             style={arMode ? { borderColor: 'var(--accent-amber)', color: 'var(--accent-amber)' } : {}}
           >
             <Eye size={14} />
-            {arMode ? 'Exit AR Mode' : 'AR View'}
+            {arMode ? 'Exit AR' : 'AR View'}
           </button>
 
           <button
@@ -519,7 +539,7 @@ export const SceneViewer: React.FC<SceneViewerProps> = ({
             onClick={handleTakeScreenshot}
           >
             <CameraIcon size={14} />
-            Screenshot
+            Capture
           </button>
         </div>
       </div>
@@ -527,7 +547,7 @@ export const SceneViewer: React.FC<SceneViewerProps> = ({
       {/* Bottom HUD Coordinate Status */}
       <div className="viewport-hud-bottom">
         <div className="glass-panel" style={{ padding: '4px 10px', fontSize: '0.72rem', fontFamily: 'var(--font-mono)', color: 'var(--text-muted)' }}>
-          Mode: <strong style={{ color: 'var(--accent-cyan)' }}>Right-Handed Y-Up</strong> | Depth Occlusion: <strong style={{ color: globalOcclusionEnabled ? 'var(--accent-emerald)' : 'var(--accent-rose)' }}>{globalOcclusionEnabled ? 'Active' : 'Bypassed'}</strong>
+          Coordinate Frame: <strong style={{ color: 'var(--accent-cyan)' }}>Right-Handed Y-Up</strong> | Depth Occlusion: <strong style={{ color: globalOcclusionEnabled ? 'var(--accent-emerald)' : 'var(--accent-rose)' }}>{globalOcclusionEnabled ? 'Active' : 'Bypassed'}</strong>
         </div>
       </div>
     </div>
